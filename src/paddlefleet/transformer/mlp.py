@@ -305,6 +305,12 @@ class MLP(FleetLayer):
             _use_paddle_swiglu
             and self.hidden_act == F.silu
             and self.config.gated_linear_unit
+            # A per-token scale (the MoE router weight) must go through the
+            # weighted branch below: the reference multiplies the weight inside
+            # the activation, doing the whole product in fp32 with a single
+            # round. ``F.swiglu`` here would round to bf16 first and multiply
+            # afterwards, adding one extra rounding.
+            and per_token_scale is None
         ):
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel

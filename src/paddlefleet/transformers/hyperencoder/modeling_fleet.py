@@ -274,10 +274,23 @@ class HyperEncoderModel(FleetLayer):
         )
 
         # ---- RoPE ----
+        from paddlefleet.tf32_math import mg_exact_backward_enabled
+
         self.rotary_pos_emb = RotaryEmbedding(
             head_dim=config.head_dim,
             rotary_percent=config.rotary_percent,
             rotary_base=config.rope_theta,
+            # Gated on ``PADDLEFLEET_MG_EXACT_BACKWARD``: off (default) = upstream
+            # (GPU ``pow``, matches the PR); on = compute ``inv_freq``'s ``pow``
+            # on CPU. Paddle's GPU ``pow`` differs from the baseline by one fp32
+            # ULP, which ``outer(seq, inv_freq)`` amplifies to 4836/81920 freqs
+            # elements; after ``sin`` + bf16 cast ~10 elements flip, so q/k each
+            # differ by one element and propagate into the backward. Computing on
+            # CPU then moving to GPU makes the freqs table bit-identical
+            # (0/81920). This is an existing ``RotaryEmbedding`` parameter, so
+            # gating at the call site suffices -- no need to touch the shared
+            # ``rotary_pos_embedding.py``.
+            use_accuracy_compatible=mg_exact_backward_enabled(),
         )
 
         # ---- Output projection ----

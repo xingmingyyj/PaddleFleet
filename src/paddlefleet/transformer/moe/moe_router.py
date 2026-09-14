@@ -77,6 +77,23 @@ def _get_moe_topk_fusion():
 _moe_router_logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Router fp32 GEMM: align the cuBLASLt kernel selection with TransformerEngine.
+# ---------------------------------------------------------------------------
+# Megatron's ``RouterGatingLinearFunction`` runs both the forward and backward
+# through ``te_general_gemm(..., router_dtype)``. TE requests
+# COMPUTE_32F_FAST_TF32 for fp32 GEMMs, which selects a cuBLASLt kernel with a
+# different reduction order than Paddle/torch's plain fp32 GEMM, so the router
+# logits differ by ~1.4e-06. ``te_fp32_gemm_math`` is a no-op unless
+# ``PADDLEFLEET_ROUTER_GEMM_TE_MATH=1``; wrapping the fp32 GEMMs is therefore
+# safe for production and only takes effect on the alignment leg.
+from paddlefleet.tf32_math import enabled as _te_gemm_math_enabled  # noqa: E402
+from paddlefleet.tf32_math import (  # noqa: E402
+    mg_exact_backward_enabled as _mg_exact_backward_enabled,
+)
+from paddlefleet.tf32_math import te_fp32_gemm_math as _te_fp32_gemm_math  # noqa: E402
+
+
 def _log_moe_md5(tensor, name, layer_idx=None):
     """Log MD5 of a tensor for MoE precision alignment debugging."""
     from paddlefleet.transformer.transformer_layer import TransformerLayer
@@ -229,7 +246,8 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
             # the projection itself in router_dtype=fp32. Both are valid; only
             # the first reproduces the reference logits bit-for-bit.
             return F.linear(x, w.cast(x.dtype)).cast(ctx.dtype)
-        return F.linear(x.cast(ctx.dtype), w.cast(ctx.dtype))
+        with _te_fp32_gemm_math():
+            return F.linear(x.cast(ctx.dtype), w.cast(ctx.dtype))
 
     @staticmethod
     def backward(ctx, y_grad):
@@ -243,7 +261,7 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
         x_stop_grad = x.stop_gradient
 
         def _compute_weight_grad(x_cast, y_grad, weight):
-            with paddle.amp.auto_cast(False):
+            with paddle.amp.auto_cast(False), _te_fp32_gemm_math():
                 w_grad = paddle.matmul(
                     x_cast, y_grad, transpose_x=True
                 ).T  # 始终先算梯度
@@ -273,7 +291,8 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
             x_cast = x.cast(ctx.dtype)
             w_cast = w.cast(ctx.dtype)
 
-            x_g = paddle.matmul(y_grad, w_cast.T, transpose_y=True)
+            with _te_fp32_gemm_math():
+                x_g = paddle.matmul(y_grad, w_cast.T, transpose_y=True)
             x_grad = x_g.cast(x.dtype) if not x_stop_grad else None
 
             if w_stop_grad:
@@ -301,26 +320,42 @@ class FusedGateDetachMatmul(paddle.autograd.PyLayer):
                 x_grad = x_g.cast(x.dtype) if not x_stop_grad else None
                 w_grad = w_g.cast(w.dtype) if not w_stop_grad else None
                 return x_grad, w_grad
-            if ctx.use_accuracy_compatible:
+            if ctx.use_accuracy_compatible or _te_gemm_math_enabled():
                 # Mirror MG `RouterGatingLinearFunction.backward`:
                 #   grad_input  = torch.mm(grad_output, weight.to(router_dtype))
                 #   grad_weight = torch.mm(grad_output.t(), inp.to(router_dtype))
                 # i.e. two separate GEMMs (not a fused matmul_grad), then each
-                # gradient cast back to its own storage dtype.
-                x_g = paddle.matmul(y_grad, w.cast(ctx.dtype))
-                w_g = paddle.matmul(y_grad, x.cast(ctx.dtype), transpose_x=True)
+                # gradient cast back to its own storage dtype. When the TE-math
+                # (alignment) leg is on we also take this same-shape path so the
+                # router.weight grad matches MG bit-for-bit.
+                with _te_fp32_gemm_math():
+                    x_g = paddle.matmul(y_grad, w.cast(ctx.dtype))
+                    w_g = paddle.matmul(
+                        y_grad, x.cast(ctx.dtype), transpose_x=True
+                    )
                 x_grad = x_g.cast(x.dtype) if not x_stop_grad else None
                 w_grad = w_g.cast(w.dtype) if not w_stop_grad else None
+                if w_grad is not None and _te_gemm_math_enabled():
+                    # MG stores router.weight as bf16 and its backward ends with
+                    # `grad_weight.to(weight_dtype)`, so the wgrad passes through
+                    # bf16 once before landing in the fp32 main_grad. The value
+                    # itself is already bit-identical; this reproduces that one
+                    # extra rounding so multi-step alignment stays exact.
+                    if w_grad.dtype == paddle.float32:
+                        w_grad = w_grad.cast(paddle.bfloat16).cast(
+                            paddle.float32
+                        )
                 return x_grad, w_grad
             else:
                 w = w.T
-                x_g, w_g = matmul_grad(
-                    x.cast(ctx.dtype),
-                    w.cast(ctx.dtype),
-                    y_grad,
-                    False,
-                    False,
-                )
+                with _te_fp32_gemm_math():
+                    x_g, w_g = matmul_grad(
+                        x.cast(ctx.dtype),
+                        w.cast(ctx.dtype),
+                        y_grad,
+                        False,
+                        False,
+                    )
 
                 x_grad = x_g.cast(x.dtype) if not x_stop_grad else None
                 w_grad = w_g.cast(w.dtype) if not w_stop_grad else None
@@ -344,7 +379,8 @@ def gate_detach_matmul(
         )
     else:
         x = x.cast(paddle.float32)
-        score = F.linear(x, weight)
+        with _te_fp32_gemm_math():
+            score = F.linear(x, weight)
 
     if moe_router_force_load_balancing:
         score = apply_random_logits(score)
@@ -427,7 +463,13 @@ class StandardMoERouter(nn.Layer):
             )
 
         # Initialize gate weight with Normal distribution aligned with Megatron.
-        if self.use_accuracy_compatible:
+        # The MG alignment leg also stores the gate weight in params_dtype
+        # (bf16): both references upcast to fp32 for the GEMM, so equal values
+        # match forward+backward, but once the optimizer updates them a 24-bit
+        # fp32 weight and an 8-bit bf16 weight diverge on the very next step.
+        # `use_accuracy_compatible` is a separate packaging switch and cannot be
+        # reused here, so gate on `PADDLEFLEET_MG_EXACT_BACKWARD` directly.
+        if self.use_accuracy_compatible or _mg_exact_backward_enabled():
             self.weight = paddle.create_parameter(
                 shape=[self.num_experts, self.hidden_size],
                 dtype=config.params_dtype,

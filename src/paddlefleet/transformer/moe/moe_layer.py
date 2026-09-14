@@ -115,6 +115,12 @@ from .moe_utils import (
     permute,
     unpermute,
 )
+from paddlefleet.tf32_math import (
+    mg_exact_backward_enabled as _mg_exact_bwd_enabled,
+)
+from paddlefleet.tf32_math import (
+    mg_exact_moe_dispatcher_enabled as _mg_exact_dispatcher,
+)
 
 
 class GradDtypeGuard(PyLayer):
@@ -159,6 +165,30 @@ class ThreePathCloneAlignMG(PyLayer):
         partial = g_dispatcher + g_shared
         out = partial + g_router
         return out
+
+
+class ThreePathCloneOrderRouterRoutedShared(PyLayer):
+    """Three-way identity clone whose backward sums as ``(router + routed) + shared``.
+
+    The sum order is empirically determined (doc/06 P-13): sweeping all 3!
+    orders of the three partial sums, only this one is bit-identical to MG
+    (0/819200 mismatches), whereas ``ThreePathCloneAlignMG`` uses
+    ``(routed + shared) + router`` which differs by 99121/819200 on this model.
+    Addition is not associative, so the accumulation order cannot be chosen by
+    "what looks reasonable" -- it must be swept.
+
+    Precondition: each of the three partial sums is itself bit-exact and the
+    routed one has a deterministic internal accumulation (see
+    ``_OrderedRowGather``); otherwise a swept "hit" is just noise.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.clone(), x.clone(), x.clone()
+
+    @staticmethod
+    def backward(ctx, g_router, g_dispatcher, g_shared):
+        return (g_router + g_dispatcher) + g_shared
 
 
 class HFMoeFanout(PyLayer):
@@ -270,6 +300,50 @@ class MoESublayers:
     """MoE Layer Sublayers spec"""
 
     mlp_spec: LayerSpec | type = None  # Used by experts
+
+
+class _OrderedRowGather(paddle.autograd.PyLayer):
+    """Row gather with a deterministic, expert-ascending backward accumulation.
+
+    Why plain ``paddle.gather`` cannot be used (doc/06 P-13): with topk=6 each
+    token appears 6 times in ``idx``, so gather's backward is a duplicate-index
+    scatter-add. On GPU Paddle routes that through atomics, so the result is
+    non-deterministic run-to-run (the same input gives three different md5s for
+    ``grad mlp/in``). Bit-exact alignment is impossible without reproducibility.
+    MG's permute backward is an ``index_add`` and the reference enables
+    ``torch.use_deterministic_algorithms(True)``, so its order is fixed and
+    expert-major.
+
+    Approach: ``idx`` is expert-major with tokens ascending within each group.
+    A stable argsort makes each token's topk rows contiguous while keeping the
+    within-group expert-ascending order, so reshaping to ``[S, topk, H]`` and
+    summing sequentially is equivalent to an expert-ascending ``index_add`` and
+    is fully deterministic (no atomics).
+    """
+
+    @staticmethod
+    def forward(ctx, x, idx):
+        perm = paddle.argsort(idx, stable=True)
+        ctx.save_for_backward(idx, perm)
+        ctx.n_rows = x.shape[0]
+        return paddle.gather(x, idx, axis=0)
+
+    @staticmethod
+    def backward(ctx, g):
+        idx, perm = ctx.saved_tensor()
+        n_rows = ctx.n_rows
+        total = g.shape[0]
+        topk = total // n_rows
+        assert topk * n_rows == total, (
+            f"each token should appear exactly topk times: total={total} n_rows={n_rows}"
+        )
+        rows = paddle.gather(g, perm, axis=0).reshape(
+            [n_rows, topk, g.shape[-1]]
+        )
+        acc = rows[:, 0]
+        for j in range(1, topk):
+            acc = acc + rows[:, j]
+        return acc
 
 
 class MoELayer(nn.Layer):
@@ -479,7 +553,16 @@ class MoELayer(nn.Layer):
             and self.tensor_model_parallel_size > 1
         ):
             routed_expert_config.sequence_parallel = False
-            if not self.config.gpt_model_use_experimental_version:
+            if _mg_exact_dispatcher():
+                # Alignment leg (``PADDLEFLEET_MG_EXACT_MOE_DISPATCHER=1``): the
+                # shared expert keeps ``sequence_parallel=True``, i.e. it runs on
+                # the local SP shard, fc1 all-gathers to the full sequence
+                # internally and fc2 reduce-scatters back, so in/out are
+                # ``[S/tp,B,H]`` -- matching MCore ``SharedExpertMLP`` (doc/06
+                # P-20). The production path (switch off) keeps the original
+                # behaviour: shared expert on the full sequence, fc2 all-reduce.
+                shared_expert_config.sequence_parallel = True
+            elif not self.config.gpt_model_use_experimental_version:
                 shared_expert_config.sequence_parallel = False
         elif (
             self.expert_model_parallel_size > 1
@@ -511,7 +594,14 @@ class MoELayer(nn.Layer):
                 self.moe_deep_gemm = False
 
         self.moe_use_fusion_node = config.moe_use_fusion_node
-        if self.expert_model_parallel_size > 1:
+        # ``_mg_exact_dispatcher()``: build the dispatcher even at EP=1 to isolate
+        # the EP dimension (doc/06 P-18: Paddle's EP=1 and EP>1 are two separate
+        # implementations while MG uses one for both). This block is config
+        # validation: it turns ``moe_use_fusion_node`` off when the dispatcher is
+        # not deepep/hybridep. When forcing the dispatcher at single card it must
+        # run too, otherwise ``moe_use_fusion_node`` stays True and the forward
+        # falls into ``fusion_moe_forward`` instead of ``custom_forward``.
+        if self.expert_model_parallel_size > 1 or _mg_exact_dispatcher():
             if self.moe_token_dispatcher_type in (
                 "deepep",
                 "hybridep",
@@ -634,7 +724,15 @@ class MoELayer(nn.Layer):
                     self.experts.append(None)
 
         shared_expert_args = deepcopy(expert_args)
-        if self.config.gpt_model_use_experimental_version:
+        if self.config.gpt_model_use_experimental_version or _mg_exact_dispatcher():
+            # Without ``gpt_model_use_experimental_version`` the shared expert
+            # originally reused ``routed_expert_config`` (whose ``sequence_parallel``
+            # is forced False under SP), so it ran on the local shard with fc2
+            # all-reduce -- not MG's "fc1 all-gather, fc2 reduce-scatter" operator
+            # sequence (doc/06 P-20). The alignment leg switches it to
+            # ``shared_expert_config`` (``sequence_parallel=True``). Routed experts
+            # keep ``routed_expert_config`` (SP=False): they already run on the
+            # gathered full token set and must not enable SP.
             shared_expert_args["is_expert"] = False
             shared_expert_args["config"] = shared_expert_config
         shared_expert_args["config"].use_bias = shared_expert_config.use_bias
@@ -672,7 +770,9 @@ class MoELayer(nn.Layer):
                     self.shared_experts.down_proj.bias
                 )
 
-        if self.expert_model_parallel_size > 1:
+        # ``_mg_exact_dispatcher()``: build the dispatcher even at EP=1 to isolate
+        # the EP dimension (doc/06 P-18).
+        if self.expert_model_parallel_size > 1 or _mg_exact_dispatcher():
             if self.moe_token_dispatcher_type in (
                 "deepep",
                 "hybridep",
@@ -733,8 +833,18 @@ class MoELayer(nn.Layer):
                     self.expert_model_parallel_size,
                     self.num_experts_per_device,
                     local_expert_indices,
-                    use_accuracy_compatible=getattr(
-                        self, "use_accuracy_compatible", False
+                    # ``use_accuracy_compatible`` here only controls whether
+                    # permute/unpermute take the aligned (deterministic
+                    # gather-sum) path, matching MG's combine/permute. The
+                    # default scatter-based path uses GPU atomics whose order is
+                    # non-deterministic and differs from MG. It must additionally
+                    # look at the alignment leg; we cannot flip the whole
+                    # ``use_accuracy_compatible`` config (that would also switch
+                    # the router compute back to params_dtype, conflicting with
+                    # MG's ``moe_router_dtype=fp32``). Borrow just this parameter.
+                    use_accuracy_compatible=(
+                        getattr(self, "use_accuracy_compatible", False)
+                        or _mg_exact_bwd_enabled()
                     ),
                 )
             elif self.use_intermediate_ep_sharding:
@@ -992,8 +1102,15 @@ class MoELayer(nn.Layer):
                 scale_chunks = paddle.split(
                     per_token_scale, num_or_sections=tokens_per_expert, axis=0
                 )
+        # The alignment leg does NOT skip 0-token experts: MG's SequentialMLP
+        # runs every local expert (0-row GEMM), so its weight grad is an all-0
+        # tensor; ``continue`` here keeps those experts out of the graph, giving
+        # a ``None`` grad. ``None`` != ``0`` across steps -- Adam still updates
+        # momentum / weight decay from a 0 grad. Same fix as the single-card path
+        # (doc/06 P-13); this is the EP>1 path (doc/06 P-18).
+        _mg_exact = _mg_exact_bwd_enabled()
         for i, chunk in enumerate(chunks):
-            if tokens_per_expert[i] == 0:
+            if tokens_per_expert[i] == 0 and not _mg_exact:
                 continue
             chunk = chunk.contiguous()
             current_expert_idx = i + self.moe_rank * self.num_experts_per_device
@@ -1336,12 +1453,43 @@ class MoELayer(nn.Layer):
                 self.token_dispatcher.get_dispatched_routing()[2],
                 is_mtp_layer=self.is_mtp_layer,
             )
+        # The ETP reduction must bracket the expert compute on BOTH sides (once
+        # forward, once backward). MG's dispatcher does: permute local -> ETP
+        # all-gather -> experts -> ETP reduce-scatter -> unpermute local. The
+        # ordering matters: the two ETP partial sums must be added BEFORE the
+        # unpermute's bf16 accumulations (topk=6), because addition is not
+        # associative (doc/06 P-18/P-20). Forward uses all-reduce (both ranks
+        # hold partial sums of the same rows, so all-reduce gives each the full
+        # set, then each unpermutes and ``ScatterOp`` slices back). The backward
+        # must be symmetric, so an entry ``copy_to_tensor_model_parallel_region``
+        # (identity forward, all-reduce backward) adds the ETP partial sum before
+        # the permute backward -- matching MG's order. The forward ``hidden_states``
+        # gather in ``forward`` correspondingly uses ``tensor_parallel_output_grad
+        # =False`` so ETP is not added twice.
+        if _mg_exact_dispatcher() and self.sequence_parallel:
+            from paddlefleet.parallel_state import (
+                get_expert_tensor_parallel_group,
+            )
+            from paddlefleet.tensor_parallel.mappings import (
+                copy_to_tensor_model_parallel_region,
+                reduce_from_tensor_model_parallel_region,
+            )
+
+            _etp = get_expert_tensor_parallel_group(check_initialized=False)
+        else:
+            _etp = None
+        if _etp is not None and _etp.nranks > 1:
+            hidden_states = copy_to_tensor_model_parallel_region(
+                hidden_states, group=_etp
+            )
         with profile("fusion_mlp"):
             hidden_states = self.routed_experts_compute(hidden_states)
+        if _etp is not None and _etp.nranks > 1:
+            hidden_states = reduce_from_tensor_model_parallel_region(
+                hidden_states, group=_etp
+            )
         with profile("combine"):
             hidden_states = self.combine(hidden_states)
-
-        # Latent MoE: project back from latent space to hidden_size
         if self.use_latent_moe:
             if self.latent_norm is not None:
                 hidden_states = self.latent_norm(hidden_states)
@@ -1834,7 +1982,18 @@ class MoELayer(nn.Layer):
         Returns:
             output: Shape: [batch_size, seq_len, hidden_size]
         """
-        if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
+        # ---- SP + MoE: gather before vs after the router ----
+        # Default (production path, unchanged): a single ``GatherOp`` before the
+        # router, so the router sees the full sequence.
+        # When ``_mg_exact_dispatcher()`` is on we replay Megatron's op order:
+        # the router runs on the *local* SP shard ``[S/tp,B,H]`` and the gather
+        # moves to *after* the router (matching MCore ``token_dispatcher.py``
+        # gather of ``hidden_states`` / ``probs`` / ``routing_map``). The router's
+        # fp32 GEMM is M-dependent, so the two sides can only match bit-for-bit
+        # when the router's M matches; experts are bf16 GEMM and M-independent.
+        _sp_moe = self.expert_model_parallel_size <= 1 and self.sequence_parallel
+        _mg_sp_moe = _sp_moe and _mg_exact_dispatcher()
+        if _sp_moe and not _mg_sp_moe:
             hidden_states = GatherOp.apply(hidden_states)
             if residual is not None:
                 residual = GatherOp.apply(residual)
@@ -1863,7 +2022,10 @@ class MoELayer(nn.Layer):
         )
         _three_paths_enabled = (
             not _hf_bitexact_paths
-            and getattr(self, "use_accuracy_compatible", False)
+            and (
+                getattr(self, "use_accuracy_compatible", False)
+                or _mg_exact_bwd_enabled()
+            )
             and hidden_states.stop_gradient is False
             and self._supports_three_path_clone()
         )
@@ -1882,8 +2044,17 @@ class MoELayer(nn.Layer):
             _hs_dispatcher_path = _hs_core
             residuals = _hs_shared_path
         elif _three_paths_enabled:
+            # The alignment leg uses the empirically-hit sum order; the
+            # ``use_accuracy_compatible`` leg keeps its own order to avoid
+            # perturbing other models (the two orders differ, see the two class
+            # docstrings).
+            _clone_cls = (
+                ThreePathCloneOrderRouterRoutedShared
+                if _mg_exact_bwd_enabled()
+                else ThreePathCloneAlignMG
+            )
             _hs_router_path, _hs_dispatcher_path, _hs_shared_path = (
-                ThreePathCloneAlignMG.apply(hidden_states)
+                _clone_cls.apply(hidden_states)
             )
             residuals = _hs_shared_path
         else:
@@ -1921,6 +2092,46 @@ class MoELayer(nn.Layer):
         topk_weights = inspect_tensor(
             "moe_topk_weights", layer_idx, topk_weights
         )
+        if _mg_sp_moe:
+            # The router already ran on the local SP shard; now gather the
+            # tensors that feed the dispatcher into the full sequence, matching
+            # MCore ``token_dispatcher.py`` (routing_map / probs / hidden_states).
+            # ``GatherOp`` concatenates along axis 0 (the sequence dim of all of
+            # these), and int tensors are ``stop_gradient=True`` so it degrades
+            # to a plain all-gather.
+            #
+            # ``residuals`` is deliberately NOT gathered: it only feeds the
+            # shared expert, which MG runs on the local SP shard
+            # (``sequence_parallel=True``, all-gather inside fc1 / reduce-scatter
+            # inside fc2, in and out both ``[S/tp,B,H]``). Gathering it would run
+            # the shared expert on the full sequence and diverge by one reduction.
+            # ``hidden_states`` uses ``tensor_parallel_output_grad=False`` (backward
+            # only splits, does not sum): the ETP sum is already done by the
+            # ``copy_to_tensor_model_parallel_region`` at the expert entry in
+            # ``custom_forward`` -- before the permute backward, matching MG.
+            from paddlefleet.tensor_parallel.mappings import (
+                gather_from_sequence_parallel_region as _gather_sp,
+            )
+
+            _hs_dispatcher_path = _gather_sp(
+                _hs_dispatcher_path, tensor_parallel_output_grad=False
+            )
+            # ``probs`` gather MUST sum on backward (reduce-scatter), not just
+            # split: it is consumed by two ETP ranks each computing a partial
+            # sum, so the two ``d_probs`` must be added. Use PaddleFleet's
+            # ``gather_from_sequence_parallel_region`` with
+            # ``tensor_parallel_output_grad=True`` (backward reduce-scatter)
+            # rather than ``AllGatherOp`` (whose backward asserts contiguity,
+            # which ``d_probs`` violates).
+            probs = _gather_sp(probs, tensor_parallel_output_grad=True)
+            # ``mask`` / ``topk_weights`` / ``topk_indices`` carry no gradient
+            # (detached upstream), so any op works; keep ``GatherOp``.
+            mask = GatherOp.apply(mask)
+            topk_weights = GatherOp.apply(topk_weights)
+            topk_indices = GatherOp.apply(topk_indices)
+            # The routed output is full-sequence shaped before scatter-back;
+            # the final reshape must use that shape.
+            orig_shape = _hs_dispatcher_path.shape
         if framework._dygraph_tracer()._has_grad:
             log_moe_losses(layer_idx, aux_loss=aux_loss, z_loss=z_loss)
 
@@ -1938,7 +2149,7 @@ class MoELayer(nn.Layer):
             combine_overlap_handle = None
 
         expert_input = self._prepare_expert_input(_hs_dispatcher_path, residual)
-        if self.expert_model_parallel_size > 1:
+        if self.expert_model_parallel_size > 1 or _mg_exact_dispatcher():
             if self.use_ring_moe:
                 output = self.ringmoe_forward(
                     expert_input,
@@ -2034,6 +2245,14 @@ class MoELayer(nn.Layer):
         output = output.reshape(orig_shape)
         output = self._post_routed_output(output)
 
+        if _mg_sp_moe:
+            # The routed output is full-sequence here and the ETP partial sum
+            # was already added before unpermute (see ``custom_forward``), so we
+            # just scatter back to the local SP shard. Order per MCore
+            # ``MoELayer.forward``: scatter the routed output to ``[S/tp,B,H]``
+            # *first*, then add the shared expert (which ran on the local shard).
+            output = ScatterOp.apply(output)
+
         if self.shared_experts is not None:
             residuals = inspect_tensor("moe_shared_input", layer_idx, residuals)
             if combine_overlap_handle is not None:
@@ -2056,7 +2275,7 @@ class MoELayer(nn.Layer):
 
         _log_moe_md5(output, "moe_final_output", layer_idx)
 
-        if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
+        if _sp_moe and not _mg_sp_moe:
             output = ScatterOp.apply(output)
         return output, None  # None is bias
 
@@ -2091,19 +2310,83 @@ class MoELayer(nn.Layer):
         tokens_per_expert = expert_mask.reshape([expert_mask.shape[0], -1]).sum(
             axis=-1
         )
+
+        # ---- Alignment leg: replace "num_experts gathers" with "one gather +
+        # per-expert slicing". MG permutes once (all tokens sorted expert-major)
+        # then splits to experts, so ``hidden_states``'s grad is accumulated
+        # exactly once (permute backward = one index_add in ascending expert
+        # order). Paddle's original code does independent gathers per expert, and
+        # autograd accumulates into ``hidden_states.grad`` in reverse loop order
+        # (expert 63->0); with topk=6 each token has 6 contributions and swapping
+        # the order changes the result by one bf16 ULP (doc/06 P-13). One gather
+        # makes it isomorphic to MG: the slice backwards do not overlap and add
+        # no accumulation, so the only accumulation into ``hidden_states`` is the
+        # single gather backward. Forward is unaffected (rows are independent).
+        _mg_exact = _mg_exact_bwd_enabled()
+        _rows, _offs, _gathered = None, None, None
+        if _mg_exact:
+            _rows = []
+            for _e in range(self.num_experts):
+                _i, _t = paddle.where(expert_mask[_e].t())
+                _rows.append((_i, _t))
+            _idx_all = paddle.concat(
+                [_i.reshape([-1]) for _i, _ in _rows], axis=0
+            )
+            _gathered = _OrderedRowGather.apply(hidden_states, _idx_all)
+            _offs = [0]
+            for _i, _ in _rows:
+                _offs.append(_offs[-1] + int(_i.shape[0]))
+
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
-            top_x, idx = paddle.where(expert_mask[expert_idx])
+            # ``expert_mask[expert_idx]`` is ``[topk, seq]`` and ``paddle.where``
+            # is row-major, so the original order is "topk slot first, then token
+            # index". MG's permute groups by expert then sorts tokens ascending
+            # within the group; transposing to ``[seq, topk]`` makes the row-major
+            # order match it. The forward is row-independent (so row order does
+            # not affect the forward md5), but the wgrad backward reduces along
+            # the token axis, so a different row order changes the reduction
+            # order (doc/06 P-12).
+            if _mg_exact:
+                idx, top_x = _rows[expert_idx]
+            else:
+                top_x, idx = paddle.where(expert_mask[expert_idx])
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            if tokens_per_expert[expert_idx] <= 0.1:
+            # The alignment leg does NOT skip 0-token experts: MG's SequentialMLP
+            # runs every local expert (0-row GEMM) so its weight grad is an all-0
+            # tensor, while Paddle's ``continue`` keeps those experts out of the
+            # graph, giving a ``None`` grad. ``None`` != ``0`` across steps (Adam
+            # still updates momentum / weight decay from a 0 grad) (doc/06 P-13).
+            if tokens_per_expert[expert_idx] <= 0.1 and not _mg_exact:
                 continue
-            current_state = hidden_states[idx, None].reshape([-1, d_model])
-            expert_out = expert_layer(current_state)[0]
-            current_weight = topk_weights[idx, top_x].unsqueeze(-1)
-            current_hidden_states = expert_out * current_weight
+            if _mg_exact:
+                # Slice this expert's segment out of the single gather. It MUST
+                # be cloned into an independent tensor: feeding a slice view
+                # sends fc1's wgrad GEMM down a different kernel path (measured
+                # ``linear_fc1.weight`` drops 54/54 -> 29/54). See doc/06 P-7.
+                current_state = paddle.clone(
+                    _gathered[_offs[expert_idx] : _offs[expert_idx + 1]]
+                )
+            else:
+                current_state = hidden_states[idx, None].reshape([-1, d_model])
+            # MG's SequentialMLP passes the per-token router weight INTO the
+            # expert and multiplies inside the activation:
+            # ``weighted_bias_swiglu_impl`` computes ``silu * y_2 * weight`` in
+            # fp32 with a single round. The original path multiplied after the
+            # expert (already rounded to bf16), adding one extra round -- measured
+            # 1604/112000 elements (one bf16 ULP) off (doc/06 P-11).
+            if _mg_exact:
+                current_weight = topk_weights[idx, top_x]
+                current_hidden_states = expert_layer(
+                    current_state, per_token_scale=current_weight
+                )[0]
+            else:
+                expert_out = expert_layer(current_state)[0]
+                current_weight = topk_weights[idx, top_x].unsqueeze(-1)
+                current_hidden_states = expert_out * current_weight
 
             # use scatter to replace index_add
             final_hidden_states_tmp = paddle.zeros_like(final_hidden_states)

@@ -196,7 +196,21 @@ class _UnpermuteGatherSumAlignedPyLayer(PyLayer):
                 for slot in range(1, topk):
                     output_tokens = output_tokens + gathered[:, slot]
             return output_tokens.cast(ctx.input_dtype)
-        output_tokens = gathered.sum(axis=1)
+        # Alignment leg (``PADDLEFLEET_MG_EXACT_BACKWARD=1``): replicate MG's
+        # ``output.index_add_(0, sorted_indices, permuted_tokens)`` -- bf16
+        # accumulation rounded once per add (topk rounds), instead of
+        # ``sum(axis=1)`` which accumulates in fp32 and rounds once. Matches the
+        # single-card ``_OrderedRowGather.backward`` in moe_layer.py.
+        # Only the alignment leg pays this cost: this file is shared by every
+        # MoE, and production keeps the faster / more accurate fp32 ``sum``.
+        from paddlefleet.tf32_math import mg_exact_backward_enabled
+
+        if mg_exact_backward_enabled():
+            output_tokens = gathered[:, 0]
+            for _slot in range(1, topk):
+                output_tokens = output_tokens + gathered[:, _slot]
+        else:
+            output_tokens = gathered.sum(axis=1)
         return output_tokens.cast(ctx.input_dtype)
 
     @staticmethod
@@ -411,17 +425,35 @@ class _PermuteAlignedPyLayer(PyLayer):
                     acc = acc + gathered[:, slot]
             return acc.cast(ctx.input_dtype)
 
-        # gather → [N*topk, H] in fp32 → reshape [N, topk, H] → sum(axis=1)
-        gathered = grad_permuted.cast("float32").index_select(
-            axis=0, index=gather_index_flat
-        )
+        # Alignment leg (``PADDLEFLEET_MG_EXACT_BACKWARD=1``): accumulate in the
+        # *input* dtype (bf16) to replicate MG's repeated-index ``index_add`` in
+        # the permute backward (bf16, topk rounds). Non-aligned (production
+        # default): cast(fp32) then sum, rounding only once (= upstream).
+        from paddlefleet.tf32_math import mg_exact_backward_enabled
+
+        _mg = mg_exact_backward_enabled()
+        # gather → [N*topk, H] → reshape [N, topk, H] → reduce over topk
+        if _mg:
+            gathered = grad_permuted.index_select(
+                axis=0, index=gather_index_flat
+            )
+        else:
+            gathered = grad_permuted.cast("float32").index_select(
+                axis=0, index=gather_index_flat
+            )
         gathered = gathered.reshape([ctx.num_tokens, ctx.topk, ctx.hidden])
         if ctx.has_padding:
             # Padding rows point at slot 0; their gradient must stay zero.
-            gathered = gathered * valid_rows.cast("float32").reshape(
+            # Multiplying by 1.0 / 0.0 is exact in bf16, introduces no rounding.
+            gathered = gathered * valid_rows.cast(gathered.dtype).reshape(
                 [ctx.num_tokens, 1, 1]
             )
-        grad_tokens = gathered.sum(axis=1)
+        if _mg:
+            grad_tokens = gathered[:, 0]
+            for _slot in range(1, ctx.topk):
+                grad_tokens = grad_tokens + gathered[:, _slot]
+        else:
+            grad_tokens = gathered.sum(axis=1)
         return grad_tokens.cast(ctx.input_dtype)
 
 
@@ -595,7 +627,12 @@ class _AllToAll(paddle.autograd.PyLayer):
         ctx.in_split_sizes = in_split_sizes
 
         # return input
-        if dist.get_world_size(group) <= 1:
+        # ``group is None`` must short-circuit *explicitly*: ``get_world_size(None)``
+        # returns the *global* group size, so at EP=1 with another parallel dim >1
+        # (e.g. tp=2 / ep=1) it is 2 and would not short-circuit, while split sizes
+        # were computed for ep_size=1 -> length mismatch error. No EP group means
+        # EP=1 and all-to-all is the identity permutation, so return directly.
+        if group is None or dist.get_world_size(group) <= 1:
             return input
 
         output = paddle.empty(
@@ -625,7 +662,12 @@ class _AllToAll(paddle.autograd.PyLayer):
             tuple[Tensor]: A tuple containing a tensor that holds the gradients of all input tensors.
         """
         # return grad_output
-        paddle.distributed.barrier(ctx.group)
+        # Forward already short-circuits when ``get_world_size(group) <= 1``;
+        # backward must skip symmetrically -- otherwise a single rank / ``group
+        # is None`` (the single-card forced-dispatcher path) makes this barrier
+        # fetch a non-existent global group. Barrier is sync-only, no numerics.
+        if ctx.group is not None:
+            paddle.distributed.barrier(ctx.group)
         return _AllToAll.apply(
             ctx.input_shape,
             *grad_output,
@@ -1089,7 +1131,10 @@ def all_gather_group(input, group=None, axis=0):
                 - When axis=0: shape [D*N, ...] (N = group size)
                 - Otherwise:   shape [..., D*N, ...] along specified axis
     """
-    parallelism = group.nranks
+    # ``group is None`` is equivalent to a single rank (the single-card
+    # forced-dispatcher path): all-gather degrades to the identity, so return a
+    # copy directly and avoid touching a non-existent global group.
+    parallelism = 1 if group is None else group.nranks
     if parallelism == 1:
         return input.clone()
     output_shape = input.shape
@@ -1148,7 +1193,13 @@ class AllGatherGroupOp(paddle.autograd.PyLayer):
             Tensor: Assembled tensor after All-Gather with shape [s, b, h],
                    containing full parameter from all devices
         """
-        paddle.distributed.barrier(group)
+        # When ``group is None`` ``barrier`` fetches the global group, which does
+        # not exist under the single-card forced-dispatcher path
+        # (``PADDLEFLEET_MG_EXACT_MOE_DISPATCHER=1``) -> "global group is not
+        # initialized". Barrier is sync-only, no numerics, so skip when group is
+        # None (equivalent to a single rank).
+        if group is not None:
+            paddle.distributed.barrier(group)
         ctx.group = group
         return all_gather_group(input, group=group)
 

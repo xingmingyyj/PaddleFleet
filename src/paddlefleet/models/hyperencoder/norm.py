@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import paddle
 from paddle import Tensor
 
+from paddlefleet.tf32_math import mg_exact_backward_enabled
+
 # Optional import: older Paddle versions may not ship this utility.
 try:
     from paddle.distributed.fleet.utils.sequence_parallel_utils import (
@@ -41,6 +43,44 @@ if TYPE_CHECKING:
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
 __all__ = ["HyperEncoderRMSNorm"]
+
+
+class _HyperEncoderRMSNormFunction(paddle.autograd.PyLayer):
+    """Hand-written fp32 RMSNorm forward/backward.
+
+    The forward is bit-identical to :meth:`HyperEncoderRMSNorm.forward`. The
+    backward derives the input and weight gradients from an explicit fp32
+    expression rather than relying on autograd over the forward graph, so the
+    reduction order is fully controlled. This path is only taken when the
+    exact-backward mode is enabled.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, eps):
+        t1 = x.astype(paddle.float32)
+        t4 = paddle.mean(t1 * t1, axis=-1, keepdim=True) + eps
+        t5 = paddle.rsqrt(t4)
+        out = (t1 * t5) * weight.astype(paddle.float32)
+        ctx.save_for_backward(x, weight)
+        ctx.eps = eps
+        return out.astype(x.dtype)
+
+    @staticmethod
+    def backward(ctx, g):
+        x, weight = ctx.saved_tensor()
+        hidden = x.shape[-1]
+        t1 = x.astype(paddle.float32)
+        t4 = paddle.mean(t1 * t1, axis=-1, keepdim=True) + ctx.eps
+        t5 = paddle.rsqrt(t4)
+        g7 = g.astype(paddle.float32)
+        g6 = g7 * weight.astype(paddle.float32)
+        g5 = paddle.sum(g6 * t1, axis=-1, keepdim=True)
+        g4 = -0.5 * g5 * (t5 * t5 * t5)
+        dx = (g6 * t5 + (g4 / hidden) * 2.0 * t1).astype(x.dtype)
+        dw = paddle.sum(
+            (g7 * (t1 * t5)).reshape([-1, hidden]), axis=0
+        ).astype(weight.dtype)
+        return dx, dw
 
 
 class HyperEncoderRMSNorm(paddle.nn.Layer):
@@ -128,7 +168,16 @@ class HyperEncoderRMSNorm(paddle.nn.Layer):
         this class always computes in fp32, so they have no effect. The
         reduction goes through ``paddle.mean`` directly (not a fused kernel),
         and the return dtype follows the input dtype.
+
+        When exact-backward mode is enabled the computation is routed through
+        :class:`_HyperEncoderRMSNormFunction`, whose forward is bit-identical
+        to the expression below but whose backward uses an explicit fp32
+        formulation with a controlled reduction order.
         """
+        if mg_exact_backward_enabled():
+            return _HyperEncoderRMSNormFunction.apply(
+                hidden_states, self.weight, self.variance_epsilon
+            )
         t1 = hidden_states.astype(paddle.float32)
         t4 = paddle.mean(t1 * t1, axis=-1, keepdim=True) + self.variance_epsilon
         t5 = paddle.rsqrt(t4)

@@ -952,9 +952,28 @@ class DotProductAttention(FleetLayer):
         # ===========================
 
         if self.config.use_accuracy_compatible or use_eager:
+            from paddlefleet.tf32_math import mg_exact_backward_enabled
+
+            # This block used to unconditionally promote softmax to fp32. But
+            # this model's ``attention_softmax_in_fp32`` is False, so the whole
+            # softmax (including backward) runs in bf16. Forcing fp32 keeps the
+            # forward probs bit-identical, but the backward gains an extra
+            # fp32<->bf16 cast and a different rowsum dtype (~1.25 bf16 ULP on
+            # d_scores). On the alignment leg
+            # (``PADDLEFLEET_MG_EXACT_BACKWARD=1``) respect the config's explicit
+            # value instead.
+            _mg_exact = mg_exact_backward_enabled()
+            _want_fp32 = (
+                bool(getattr(self.config, "attention_softmax_in_fp32", True))
+                if _mg_exact
+                else True
+            )
             if hasattr(self.scale_mask_softmax, "softmax_in_fp32"):
-                self.scale_mask_softmax.softmax_in_fp32 = True
-            if hasattr(self.config, "attention_softmax_in_fp32"):
+                self.scale_mask_softmax.softmax_in_fp32 = _want_fp32
+            if (
+                hasattr(self.config, "attention_softmax_in_fp32")
+                and not _mg_exact
+            ):
                 self.config.attention_softmax_in_fp32 = True
             if hasattr(self.scale_mask_softmax, "input_in_bf16"):
                 if attention_scores.dtype == paddle.bfloat16:

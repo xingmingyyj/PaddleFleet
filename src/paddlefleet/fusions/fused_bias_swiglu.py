@@ -38,6 +38,24 @@ def swiglu(y):
     Returns:
         paddle.Tensor: Result of SwiGLU activation: SiLU(y1) * y2, where y1, y2 are the split halves.
     """
+    # The Megatron counterpart is compiled via ``torch.compile`` into an
+    # Inductor-generated Triton kernel whose ``x / (1 + exp(-x))`` uses Triton's
+    # plain division (not round-to-nearest). ``F.swiglu`` is the "more correct"
+    # one and differs by a single fp32 ULP, usually absorbed by the bf16
+    # rounding but flipping a bit on ties. Route through the Triton replica only
+    # on the alignment leg (``PADDLEFLEET_MG_EXACT_BACKWARD=1``); production keeps
+    # the Paddle-native implementation unchanged.
+    from paddlefleet.tf32_math import mg_exact_backward_enabled
+    from paddlefleet.triton_ops.utils import is_triton_available
+
+    if (
+        mg_exact_backward_enabled()
+        and is_triton_available()
+        and y.place.is_gpu_place()
+    ):
+        from paddlefleet.triton_ops.swiglu_mg_exact import swiglu_forward_triton
+
+        return swiglu_forward_triton(y, None)
     return F.swiglu(y)
 
 
@@ -69,6 +87,22 @@ def bias_swiglu_eager(y, bias):
 @jit_fuser
 def weighted_swiglu(y, weights):
     dtype = y.dtype
+    # Alignment leg only: the Megatron counterpart fuses the whole pointwise
+    # chain (including the ``weights`` multiply) into a single fp32 Triton
+    # kernel with one final bf16 round, using Triton's plain division inside
+    # silu. Replicate it with the same Triton kernel. Production (gate off)
+    # keeps the Paddle-native two-step form.
+    from paddlefleet.tf32_math import mg_exact_backward_enabled
+    from paddlefleet.triton_ops.utils import is_triton_available
+
+    if (
+        mg_exact_backward_enabled()
+        and is_triton_available()
+        and y.place.is_gpu_place()
+    ):
+        from paddlefleet.triton_ops.swiglu_mg_exact import swiglu_forward_triton
+
+        return swiglu_forward_triton(y, weights)
     res = swiglu(y) * weights
     return res.to(dtype)
 
@@ -88,6 +122,20 @@ def swiglu_back(g, y):
         paddle.Tensor: Gradient with respect to the input tensor, computed using the
             Paddle native SwiGLU gradient operator.
     """
+    # As with ``swiglu``: the baseline is a compiled Triton kernel, and
+    # ``paddle._C_ops.swiglu_grad`` differs on a few elements. Route through the
+    # Triton replica on the alignment leg only.
+    from paddlefleet.tf32_math import mg_exact_backward_enabled
+    from paddlefleet.triton_ops.utils import is_triton_available
+
+    if (
+        mg_exact_backward_enabled()
+        and is_triton_available()
+        and y.place.is_gpu_place()
+    ):
+        from paddlefleet.triton_ops.swiglu_mg_exact import swiglu_backward_triton
+
+        return swiglu_backward_triton(g, y, None)[0]
     dx, _ = paddle._C_ops.swiglu_grad(y, None, g)
     return dx
 
@@ -172,6 +220,21 @@ def bias_swiglu_back(g, y, bias):
 
 @jit_fuser
 def weighted_swiglu_back(g, y, weights):
+    # Alignment leg only: the Megatron ``weighted_swiglu_back`` fuses both the
+    # pointwise input grad and the row-reduction weights grad into a single
+    # Triton kernel; the reduction-tree shape affects the last fp32 bit. Route
+    # through the Triton replica. Production (gate off) keeps the Paddle form.
+    from paddlefleet.tf32_math import mg_exact_backward_enabled
+    from paddlefleet.triton_ops.utils import is_triton_available
+
+    if (
+        mg_exact_backward_enabled()
+        and is_triton_available()
+        and y.place.is_gpu_place()
+    ):
+        from paddlefleet.triton_ops.swiglu_mg_exact import swiglu_backward_triton
+
+        return swiglu_backward_triton(g, y, weights)
     input_dtype = y.dtype
     w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
@@ -497,6 +560,12 @@ class WeightedSwiGLUFunction(paddle.autograd.PyLayer):
         ctx.fp8_input_store = fp8_input_store
         ctx.clamp_value = clamp_value
         ctx.use_accuracy_compatible = use_accuracy_compatible
+        # The per-token weight may be a constant (for example when an isolated
+        # expert test feeds the router probs directly). Paddle's PyLayer
+        # requires backward to return None at any position whose forward input
+        # had ``stop_gradient=True``, otherwise it raises
+        # "backward function should return None at N position".
+        ctx.weights_needs_grad = not weights.stop_gradient
         if clamp_value is not None and clamp_value > 0:
             res = clamped_weighted_swiglu(input, weights, clamp_value)
         elif use_accuracy_compatible:
@@ -520,7 +589,7 @@ class WeightedSwiGLUFunction(paddle.autograd.PyLayer):
             )
         else:
             tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
-        return tmp, wgrad
+        return tmp, (wgrad if ctx.weights_needs_grad else None)
 
 
 def bias_swiglu_impl(

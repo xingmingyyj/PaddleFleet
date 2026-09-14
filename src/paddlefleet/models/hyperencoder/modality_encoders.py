@@ -46,6 +46,8 @@ import paddle
 import paddle.nn.functional as F
 from paddle import nn
 
+from paddlefleet.tf32_math import mg_exact_backward_enabled
+
 __all__ = [
     "MlpProjector",
     "PatchEmbed",
@@ -54,6 +56,38 @@ __all__ = [
     "get_abs_pos_2d",
     "get_abs_pos_1d",
 ]
+
+
+class _ProjLinear(paddle.autograd.PyLayer):
+    """Hand-written linear projector with an explicit forward and backward.
+
+    The backward computes the input gradient in transposed form
+    ``(W @ g.T).T`` rather than ``g @ W``. The two are mathematically equal but
+    tile differently, so they produce different bit patterns; the transposed
+    form matches the reference implementation's fused path when the weight also
+    requires a gradient. The weight gradient is first computed in ``[out, in]``
+    orientation and then transposed to Paddle's ``[in, out]`` layout.
+
+    The forward keeps ``matmul(x, W) + b`` with the bias added separately (not
+    fused into the matmul), matching the reference behavior on non-contiguous
+    inputs. This path is only taken when exact-backward mode is enabled;
+    otherwise the projector uses a plain ``nn.Linear``.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias):
+        ctx.save_for_backward(x, weight)
+        return paddle.matmul(x, weight) + bias
+
+    @staticmethod
+    def backward(ctx, g):
+        x, weight = ctx.saved_tensor()
+        k, n = weight.shape[0], weight.shape[1]
+        g2 = g.reshape([-1, n])
+        dx = paddle.matmul(weight, g2, transpose_y=True).t().reshape(x.shape)
+        dw = paddle.matmul(g2, x.reshape([-1, k]), transpose_x=True).t()
+        db = g2.sum(axis=0)
+        return dx, dw, db
 
 
 class MlpProjector(nn.Layer):
@@ -89,7 +123,20 @@ class MlpProjector(nn.Layer):
         self.layers = modules
 
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
-        """Apply ``self.layers(x)``."""
+        """Apply ``self.layers(x)``.
+
+        When exact-backward mode is enabled and the projector is a linear layer
+        with a bias, the computation is routed through :class:`_ProjLinear`,
+        which keeps an unfused bias add and a hand-written transposed backward.
+        The default (gate off) path uses the plain ``nn.Linear`` with a fused
+        bias and autograd backward.
+        """
+        if (
+            mg_exact_backward_enabled()
+            and isinstance(self.layers, nn.Linear)
+            and self.layers.bias is not None
+        ):
+            return _ProjLinear.apply(x, self.layers.weight, self.layers.bias)
         return self.layers(x)
 
 

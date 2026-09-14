@@ -1070,16 +1070,35 @@ class LinearWithGradAccumulationAndAsyncCommunication(paddle.autograd.Function):
                         [*leading, grad_input.shape[-1]]
                     )
                 else:
-                    weight_bwd = weight.t()
-                    if ctx.use_accuracy_compatible:
-                        # cuBLAS picks a different reduction split for a transposed
-                        # view than for the equivalent row-major matrix, and for some
-                        # shapes (observed at K=4096) the two disagree in the last
-                        # mantissa bit. torch's dgrad passes the weight as a plain
-                        # row-major [out, in] matrix, so materialize the transpose
-                        # to hit the same kernel configuration.
-                        weight_bwd = weight_bwd.contiguous()
-                    grad_input, _ = general_gemm(grad_output, weight_bwd)
+                    from paddlefleet.tf32_math import (
+                        mg_exact_backward_enabled,
+                    )
+
+                    if mg_exact_backward_enabled():
+                        # Alignment leg: dgrad must be a 2-D ``grad_output``
+                        # times a materialized transposed weight. A view
+                        # transpose routes to a different kernel, and a 3-D
+                        # ``grad_output`` is treated as a batched GEMM whose
+                        # cuBLASLt tile/split-k choice differs; flatten to 2-D
+                        # first (TE also views to 2-D before the GEMM).
+                        _w_t = paddle.assign(weight.t()).contiguous()
+                        _go_shape = grad_output.shape
+                        _go2d = grad_output.reshape([-1, _go_shape[-1]])
+                        grad_input, _ = general_gemm(_go2d, _w_t)
+                        grad_input = grad_input.reshape(
+                            list(_go_shape[:-1]) + [grad_input.shape[-1]]
+                        )
+                    else:
+                        weight_bwd = weight.t()
+                        if ctx.use_accuracy_compatible:
+                            # cuBLAS picks a different reduction split for a transposed
+                            # view than for the equivalent row-major matrix, and for some
+                            # shapes (observed at K=4096) the two disagree in the last
+                            # mantissa bit. torch's dgrad passes the weight as a plain
+                            # row-major [out, in] matrix, so materialize the transpose
+                            # to hit the same kernel configuration.
+                            weight_bwd = weight_bwd.contiguous()
+                        grad_input, _ = general_gemm(grad_output, weight_bwd)
         else:
             grad_input = None
 
@@ -1264,9 +1283,29 @@ class LinearWithGradAccumulationAndAsyncCommunication(paddle.autograd.Function):
                                 grad_weight, columns, part_t.t()
                             )
                     else:
-                        grad_weight, _ = general_gemm(
-                            total_input.t(), grad_output
+                        from paddlefleet.tf32_math import (
+                            mg_exact_backward_enabled,
                         )
+
+                        if mg_exact_backward_enabled():
+                            # Alignment leg: swap the wgrad orientation to the
+                            # Megatron convention. The two frameworks store the
+                            # weight transposed (MG ``[out, in]``, Paddle
+                            # ``[in, out]``), so MG computes ``d_out^T @ x ->
+                            # [N, K]`` while Paddle computes ``x^T @ d_out ->
+                            # [K, N]``. These are transposes of each other, but
+                            # the tile decomposition differs, so the reduction
+                            # order along M differs and large-M shapes disagree
+                            # in the last bit. The transpose itself is exact;
+                            # only the GEMM's tile decomposition changes.
+                            grad_weight, _ = general_gemm(
+                                grad_output.t(), total_input
+                            )
+                            grad_weight = grad_weight.t()
+                        else:
+                            grad_weight, _ = general_gemm(
+                                total_input.t(), grad_output
+                            )
                 elif inp_t_fp8 is not None:
                     # No bf16 input saved; dequantize the fp8 transposed
                     # activation (shape [K, M] = total_input.t()) for bf16 wgrad.
